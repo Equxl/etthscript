@@ -1,7 +1,7 @@
 -- ============================================================
--- YBA Controller v7.5 (Kavo UI + Multi-Step AutoSell)
+-- YBA Controller v7.6 (Kavo UI + Smooth Fly to Merchant)
 -- ============================================================
-print("[YBA Controller] Загрузка v7.5...")
+print("[YBA Controller] Загрузка v7.6...")
 local Library = loadstring(game:HttpGet("https://raw.githubusercontent.com/xHeptc/Kavo-UI-Library/main/source.lua"))()
 
 -- ============================================================
@@ -18,6 +18,7 @@ local TARGET_ITEMS = {
 local LUCKY_ARROW_PRICE = 75000
 local PICKUP_COOLDOWN = 0.5
 local SELL_COOLDOWN = 5
+local FLY_TO_MERCHANT_SPEED = 80  -- Скорость полёта к торговцу
 
 local State = {
     ESP = true,
@@ -29,6 +30,7 @@ local State = {
     FlySpeed = 80,
     PickupRange = 5,
     WalkSpeed = 30,
+    Busy = false, -- флаг: занят полётом к торговцу
 }
 
 -- ============================================================
@@ -118,7 +120,7 @@ local function cleanupESP()
 end
 
 -- ============================================================
--- 4. AUTOFARM
+-- 4. AUTOFARM (с учётом State.Busy)
 -- ============================================================
 local function findNearestItem()
     local char = LocalPlayer.Character
@@ -151,6 +153,9 @@ local function startAutoFarm()
     if flyConnection then return end
     flyConnection = RunService.Heartbeat:Connect(function(dt)
         if not State.AutoFarm then return end
+        -- Если AutoSell занят полётом к торговцу, не мешаем
+        if State.Busy then return end
+
         local char = LocalPlayer.Character
         if not char then return end
         local root = char:FindFirstChild("HumanoidRootPart")
@@ -207,7 +212,7 @@ local function stopAutoFarm()
 end
 
 -- ============================================================
--- 5. AUTOSELL (ПОШАГОВАЯ ЛОГИКА)
+-- 5. AUTOSELL (плавный полёт вместо телепорта)
 -- ============================================================
 
 local function hasItemsInBackpack()
@@ -237,29 +242,52 @@ local function findMerchant()
     return nil, nil
 end
 
-local function teleportToMerchant(merchant)
-    if not merchant then return end
-    local char = LocalPlayer.Character
-    if not char then return end
-    local root = char:FindFirstChild("HumanoidRootPart")
-    if not root then return end
-
-    local pos = nil
-    if merchant:IsA("Model") then
-        if merchant.PrimaryPart then
-            pos = merchant.PrimaryPart.Position
-        else
-            local part = merchant:FindFirstChildWhichIsA("BasePart")
-            if part then pos = part.Position end
+-- НОВАЯ ФУНКЦИЯ: плавный полёт к торговцу (как в AutoFarm)
+local function flyToMerchant(merchant)
+    if not merchant then return false end
+    
+    -- Определяем позицию торговца
+    local targetPos = nil
+    if merchant.PrimaryPart then
+        targetPos = merchant.PrimaryPart.Position
+    else
+        local part = merchant:FindFirstChildWhichIsA("BasePart")
+        if part then targetPos = part.Position end
+    end
+    if not targetPos then return false end
+    
+    local startTime = tick()
+    local maxTime = 15 -- максимум 15 секунд на полёт
+    
+    while tick() - startTime < maxTime do
+        local char = LocalPlayer.Character
+        if not char then return false end
+        local root = char:FindFirstChild("HumanoidRootPart")
+        if not root then return false end
+        
+        local dist = (targetPos - root.Position).Magnitude
+        
+        -- Достигли торговца (близко)
+        if dist < 6 then
+            root.AssemblyLinearVelocity = Vector3.zero
+            return true
         end
+        
+        -- Плавное движение
+        local dir = (targetPos - root.Position).Unit
+        local step = math.min(FLY_TO_MERCHANT_SPEED * 0.03, dist - 5)
+        local newPos = root.Position + dir * step
+        root.CFrame = CFrame.new(newPos, newPos + dir)
+        root.AssemblyLinearVelocity = Vector3.zero
+        
+        RunService.Heartbeat:Wait()
     end
-    if pos then
-        root.CFrame = CFrame.new(pos + Vector3.new(0, 3, 3))
-    end
+    
+    return false -- не успели долететь за 15 сек
 end
 
--- Универсальная функция нажатия кнопки по тексту
-local function clickButtonByText(searchText, exactMatch)
+-- Нажатие кнопки по тексту
+local function clickButtonByText(searchText)
     local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
     if not playerGui then return false end
     
@@ -268,14 +296,7 @@ local function clickButtonByText(searchText, exactMatch)
             for _, obj in ipairs(gui:GetDescendants()) do
                 if obj:IsA("TextButton") and obj.Visible then
                     local txt = (obj.Text or ""):lower()
-                    local found = false
-                    if exactMatch then
-                        found = (txt == searchText:lower())
-                    else
-                        found = txt:find(searchText:lower(), 1, true) ~= nil
-                    end
-                    
-                    if found then
+                    if txt:find(searchText:lower(), 1, true) then
                         obj:Fire("MouseButton1Click")
                         obj:Fire("MouseButton1Down")
                         obj:Fire("MouseButton1Up")
@@ -290,44 +311,60 @@ local function clickButtonByText(searchText, exactMatch)
 end
 
 local lastSellAttempt = 0
+local isSelling = false
 
 local function autoSellItems()
     if not State.AutoSell then return end
+    if isSelling then return end -- не запускаем дважды
     if not hasItemsInBackpack() then return end
     if tick() - lastSellAttempt < SELL_COOLDOWN then return end
     lastSellAttempt = tick()
+    isSelling = true
+    State.Busy = true -- Автофарм перестанет двигать персонажа
     
     print("[AutoSell] Есть предметы. Ищу торговца...")
     local merchant, prompt = findMerchant()
     if not merchant then
         print("[AutoSell] Торговец не найден.")
+        State.Busy = false
+        isSelling = false
         return
     end
     print("[AutoSell] Найден торговец: " .. merchant.Name)
     
-    -- 1. Подлетаем к торговцу
-    teleportToMerchant(merchant)
-    task.wait(0.5)
+    -- 1. ПЛАВНО ЛЕТИМ к торговцу (вместо телепорта)
+    print("[AutoSell] Лечу к торговцу...")
+    local ok = flyToMerchant(merchant)
+    if not ok then
+        print("[AutoSell] Не смог долететь до торговца.")
+        State.Busy = false
+        isSelling = false
+        return
+    end
+    
+    task.wait(0.3)
     
     -- 2. Открываем диалог
     print("[AutoSell] Открываю диалог...")
     pcall(function() fireproximityprompt(prompt) end)
-    task.wait(1.5) -- Ждем загрузки GUI
+    task.wait(1.5)
     
-    -- 3. Шаг 1: Нажимаем "Yes, I have any to sell..."
-    local step1 = clickButtonByText("yes, i have any to sell", false)
+    -- 3. Шаг 1: "Yes, I have any to sell..."
+    local step1 = clickButtonByText("yes, i have any to sell")
     if not step1 then
-        -- Пробуем альтернативные варианты
-        step1 = clickButtonByText("i'd like to sell", false)
+        step1 = clickButtonByText("i'd like to sell")
     end
     if not step1 then
-        step1 = clickButtonByText("sell", false)
+        step1 = clickButtonByText("any to sell")
     end
     
     if step1 then
-        task.wait(1) -- Ждем следующее окно
-        -- 4. Шаг 2: Нажимаем "I'll sell ALL of these."
-        local step2 = clickButtonByText("sell all", false)
+        task.wait(1)
+        -- 4. Шаг 2: "I'll sell ALL of these."
+        local step2 = clickButtonByText("sell all")
+        if not step2 then
+            step2 = clickButtonByText("all of these")
+        end
         if step2 then
             print("[AutoSell] Продажа успешно завершена!")
         else
@@ -336,6 +373,9 @@ local function autoSellItems()
     else
         print("[AutoSell] Не найдена кнопка начала продажи.")
     end
+    
+    State.Busy = false
+    isSelling = false
 end
 
 -- ============================================================
@@ -452,7 +492,7 @@ end)
 -- ============================================================
 -- 9. KAVO UI
 -- ============================================================
-local Window = Library.CreateLib("YBA Controller | v7.5", "BloodTheme")
+local Window = Library.CreateLib("YBA Controller | v7.6", "BloodTheme")
 
 local FarmTab = Window:NewTab("AutoFarm")
 local FarmSection = FarmTab:NewSection("Автоматизация")
@@ -467,16 +507,16 @@ FarmSection:NewToggle("★ AutoFarm", "Автоматический поиск �
     end
 end)
 
-FarmSection:NewToggle("Авто-продажа", "Подлетает к торговцу и продаёт всё", function(v)
+FarmSection:NewToggle("Авто-продажа", "Плавно летит к торговцу и продаёт всё", function(v)
     State.AutoSell = v
-    if v then print("[AutoSell] Включено. Ищем торговца...") end
+    if v then print("[AutoSell] Включено. Лечу к торговцу при наличии предметов.") end
 end)
 
 FarmSection:NewToggle("Авто-покупка Lucky Arrow", "Покупать при балансе $" .. LUCKY_ARROW_PRICE .. "+", function(v)
     State.AutoBuyLucky = v
 end)
 
-FarmSection:NewSlider("Скорость полёта", "Скорость перемещения", 200, 30, function(v) State.FlySpeed = v end)
+FarmSection:NewSlider("Скорость полёта", "Скорость перемещения (AutoFarm)", 200, 30, function(v) State.FlySpeed = v end)
 FarmSection:NewSlider("Дистанция подбора", "На каком расстоянии подбирать", 10, 1, function(v) State.PickupRange = v end)
 
 local VisualTab = Window:NewTab("Visuals")
@@ -521,30 +561,26 @@ ItemsSection:NewDropdown("Добавить предмет", "Добавить в
     end
 end)
 
--- ДОБАВЛЕННАЯ КНОПКА DEBUG
-ItemsSection:NewButton("Debug: Показать ВИДИМЫЕ кнопки", "Откройте диалог с торговцем вручную и нажмите эту кнопку", function()
-    print("=== ВИДИМЫЕ КНОПКИ В PLAYERGUI ===")
+ItemsSection:NewButton("Debug: Показать ВИДИМЫЕ кнопки", "Откройте диалог с торговцем вручную и нажмите", function()
+    print("=== ВИДИМЫЕ КНОПКИ ===")
     local pg = LocalPlayer:FindFirstChild("PlayerGui")
-    local found = false
     for _, gui in ipairs(pg:GetChildren()) do
         if gui.Enabled then
             for _, obj in ipairs(gui:GetDescendants()) do
                 if obj:IsA("TextButton") and obj.Visible and obj.Text and obj.Text ~= "" then
-                    print("  [" .. obj.Text .. "] | Путь: " .. obj:GetFullName())
-                    found = true
+                    print("  [" .. obj.Text .. "] | " .. obj:GetFullName())
                 end
             end
         end
     end
-    if not found then print("  Видимых кнопок не найдено. Убедитесь, что диалог открыт.") end
-    print("==================================")
+    print("=======================")
 end)
 
 local InfoTab = Window:NewTab("Info")
 local InfoSection = InfoTab:NewSection("О скрипте")
-InfoSection:NewLabel("YBA Controller v7.5")
-InfoSection:NewLabel("AutoSell: пошаговое нажатие кнопок")
-InfoSection:NewLabel("Шаг 1: 'Yes, I have any to sell...'")
-InfoSection:NewLabel("Шаг 2: 'I'll sell ALL of these.'")
+InfoSection:NewLabel("YBA Controller v7.6")
+InfoSection:NewLabel("AutoSell: плавный полёт вместо телепорта")
+InfoSection:NewLabel("AutoFarm пауза, пока AutoSell летит к торговцу")
+InfoSection:NewLabel("Скорость полёта к торговцу: " .. FLY_TO_MERCHANT_SPEED)
 
-print("[YBA Controller] v7.5 загружена. Автопродажа обновлена.")
+print("[YBA Controller] v7.6 загружена. Плавный полёт к торговцу активен.")
